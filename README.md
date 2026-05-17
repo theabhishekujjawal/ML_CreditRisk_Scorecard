@@ -17,7 +17,7 @@ UCD Michael Smurfit Graduate Business School
 
 Interactive credit risk prediction application:
 
-https://credit-risk-scorecard.streamlit.app
+https://mlcreditriskscorecard.streamlit.app/
 
 The application allows users to enter borrower information and instantly receive:
 
