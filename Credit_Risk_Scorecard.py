@@ -1,118 +1,149 @@
 #!/usr/bin/env python
-# coding: utf-8
+# -*- coding: utf-8 -*-
+"""
+Credit Risk Scorecard — Industry-Grade PD Model
+=================================================
+Author      : Abhishek Ujjawal
+Institution : UCD Michael Smurfit Graduate Business School
+Framework   : Basel III + IFRS 9
+Pipeline    : PD → LGD → EAD → ECL
 
-# # Project Analysis
-# **Author:** Abhishek Ujjawal
-# **Institution:** UCD Michael Smurfit Graduate Business School
+End-to-end credit risk modelling pipeline on the Kaggle
+"Give Me Some Credit" dataset (150 000 applicants).  Produces
+a calibrated Probability of Default model, CIBIL-style credit
+scores, SHAP explanations, and IFRS-9 Expected Credit Loss
+staging — all with reproducible, publication-quality visuals.
+"""
 
-# In[1]:
-
-
-import warnings
-warnings.filterwarnings('ignore')
+# ── Standard library ─────────────────────────────────────────
 import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import pickle
+import warnings
+from pathlib import Path
+
+# ── Third-party: data ────────────────────────────────────────
 import numpy as np
-np.random.seed(42)
-
-# @title
-# ═══════════════════════════════════════════════
-# CREDIT RISK SCORECARD — INDUSTRY GRADE
-# Author: Abhishek Ujjawal
-# Framework: Basel III + IFRS 9
-# Model: PD → LGD → EAD → ECL
-# ═══════════════════════════════════════════════
-
-# CELL 1: Import all libraries
-
-# Data manipulation
 import pandas as pd
-import numpy as np
+from scipy import stats
+from scipy.stats import ks_2samp
 
-# Visualization
+# ── Third-party: visualisation ───────────────────────────────
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
 import seaborn as sns
 
-# Machine Learning
+# ── Third-party: machine learning ────────────────────────────
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
-from sklearn.metrics import (roc_auc_score, roc_curve,
-                              confusion_matrix, classification_report,
-                              mean_squared_error)
+from sklearn.model_selection import (
+    train_test_split, cross_val_score, StratifiedKFold,
+)
+from sklearn.metrics import (
+    roc_auc_score, roc_curve,
+    confusion_matrix, classification_report,
+    precision_recall_curve, average_precision_score,
+    brier_score_loss, log_loss,
+)
 from sklearn.preprocessing import StandardScaler
-from sklearn.calibration import calibration_curve
-
-# Imbalanced data
+from sklearn.calibration import calibration_curve, CalibratedClassifierCV
 from imblearn.over_sampling import SMOTE
+import shap
 
-# Statistical tests
-from scipy import stats
-from scipy.stats import chi2_contingency
+# ── Project configuration ────────────────────────────────────
+from config import (
+    DATA_PATH, MODEL_PATH, MODEL_FINAL_PATH,
+    RANDOM_STATE, AGE_MIN, AGE_MAX, WINSOR_QUANTILE,
+    LATE_PAYMENT_CAP, AGE_GROUP_BINS, AGE_GROUP_LABELS,
+    TARGET_COL, FEATURES_FOR_IV, SELECTED_FEATURES,
+    IV_MIN_THRESHOLD, TEST_SIZE, SMOTE_K_NEIGHBORS,
+    LR_C, LR_MAX_ITER, CLASSIFICATION_THRESHOLD, CV_FOLDS,
+    SCORE_MIN, SCORE_MAX, LGD, EAD_MULTIPLIER, AVG_LOAN_AMOUNT,
+    STAGE_1_MAX_PD, STAGE_2_MAX_PD, REAL_PRIOR, TRAIN_PRIOR,
+    VIZ_BG_DARK, VIZ_BG_PANEL, VIZ_TEXT, VIZ_GRID, VIZ_DPI,
+    VIZ_COLOR_GOOD, VIZ_COLOR_BAD, VIZ_COLOR_NEUTRAL,
+    VIZ_COLOR_ACCENT, VIZ_COLOR_INFO, VIZ_PALETTE_SEQ,
+    VIZ_FONT_TITLE, VIZ_FONT_LABEL, VIZ_FONT_TICK, VIZ_FONT_ANNOT,
+    DELINQ_WEIGHT_30, DELINQ_WEIGHT_60, DELINQ_WEIGHT_90,
+    PDO, BASE_SCORE, BASE_ODDS,
+    FIG_EDA, FIG_WOE, FIG_MODEL, FIG_SHAP, FIG_CALIBRATION, FIG_ECL,
+)
+from utils import (
+    calculate_woe_iv, classify_iv, prior_correction,
+    pd_to_credit_score, pd_to_credit_score_pdo,
+    assign_ifrs9_stage, compute_ecl, compute_lifetime_ecl,
+    compute_ks_statistic, compute_gini, compute_psi,
+    data_quality_report,
+    apply_dark_theme, style_axis, save_figure,
+    annotate_bars, create_figure, format_thousands, format_percent,
+)
 
-# Warnings
-import warnings
+# ── Global settings ──────────────────────────────────────────
 warnings.filterwarnings('ignore')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s │ %(levelname)-8s │ %(message)s',
+)
+logger = logging.getLogger(__name__)
 
-# Display settings
+np.random.seed(RANDOM_STATE)
 pd.set_option('display.max_columns', None)
-pd.set_option('display.float_format', lambda x: '%.4f' % x)
+pd.set_option('display.float_format', '{:.4f}'.format)
+apply_dark_theme()
 
-print("✅ All libraries imported!")
-print("🏦 Credit Risk Scorecard Project Started")
-print(f"📅 Author: Abhishek Ujjawal")
+logger.info('All libraries imported successfully')
+logger.info('Credit Risk Scorecard — Pipeline Started')
+logger.info('Author: Abhishek Ujjawal')
 
 
 # In[2]:
 
 
-# @title
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 # CELL 2: LOAD DATA + FIRST LOOK
 # Industry Step: Data Acquisition & Profiling
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
-# Load dataset
-df = pd.read_csv('cs-training.csv', index_col=0)
+df = pd.read_csv(str(DATA_PATH), index_col=0)
 
 # ── Basic profiling ────────────────────────────
-print("=" * 55)
-print("DATASET OVERVIEW")
-print("=" * 55)
-print(f"Rows:         {df.shape[0]:,}")
-print(f"Columns:      {df.shape[1]}")
-print(f"Memory usage: {df.memory_usage().sum()/1024**2:.2f} MB")
+print('=' * 60)
+print('DATASET OVERVIEW')
+print('=' * 60)
+print(f'Rows:         {df.shape[0]:,}')
+print(f'Columns:      {df.shape[1]}')
+print(f'Memory usage: {df.memory_usage(deep=True).sum() / 1024**2:.2f} MB')
 
-# ── Column names ───────────────────────────────
-print("\n" + "=" * 55)
-print("COLUMNS & DATA TYPES")
-print("=" * 55)
-print(df.dtypes)
+# ── Data quality profile ──────────────────────
+print('\n' + '=' * 60)
+print('DATA QUALITY PROFILE')
+print('=' * 60)
+dq_report = data_quality_report(df)
+print(dq_report.to_string())
 
 # ── Missing values ─────────────────────────────
-print("\n" + "=" * 55)
-print("MISSING VALUES")
-print("=" * 55)
+print('\n' + '=' * 60)
+print('MISSING VALUES')
+print('=' * 60)
 missing = pd.DataFrame({
     'Missing Count':  df.isnull().sum(),
-    'Missing %':      (df.isnull().sum()/len(df)*100).round(2)
+    'Missing %':      (df.isnull().sum() / len(df) * 100).round(2)
 })
 print(missing[missing['Missing Count'] > 0])
 
 # ── Target variable distribution ───────────────
-print("\n" + "=" * 55)
-print("TARGET VARIABLE — SeriousDlqin2yrs")
-print("=" * 55)
-print("(1 = Defaulted, 0 = Paid back)")
-print(df['SeriousDlqin2yrs'].value_counts())
-print(f"\nDefault Rate: {df['SeriousDlqin2yrs'].mean()*100:.2f}%")
-print(f"Good Rate:    {(1-df['SeriousDlqin2yrs'].mean())*100:.2f}%")
+print('\n' + '=' * 60)
+print(f'TARGET VARIABLE — {TARGET_COL}')
+print('=' * 60)
+print('(1 = Defaulted, 0 = Paid back)')
+print(df[TARGET_COL].value_counts())
+default_rate = df[TARGET_COL].mean()
+print(f'\nDefault Rate: {default_rate * 100:.2f}%')
+print(f'Good Rate:    {(1 - default_rate) * 100:.2f}%')
 
 # ── First look ─────────────────────────────────
-print("\n" + "=" * 55)
-print("FIRST 5 ROWS")
-print("=" * 55)
+print('\n' + '=' * 60)
+print('FIRST 5 ROWS')
+print('=' * 60)
 print(df.head())
 
 
@@ -121,7 +152,6 @@ print(df.head())
 # In[ ]:
 
 
-# @title
 # ═══════════════════════════════════════════════
 # CELL 3: DATA UNDERSTANDING — COLUMN MEANINGS
 # Industry Step: Business Understanding
@@ -201,137 +231,136 @@ print("These issues must be fixed before modelling")
 # In[ ]:
 
 
-# @title
 # ═══════════════════════════════════════════════
 # CELL 4: EXPLORATORY DATA ANALYSIS (EDA)
 # Industry Step: Understanding Default Patterns
 # ═══════════════════════════════════════════════
 
 fig = plt.figure(figsize=(20, 16))
-fig.patch.set_facecolor('#0f1117')
+fig.patch.set_facecolor(VIZ_BG_DARK)
 gs = gridspec.GridSpec(3, 3, figure=fig)
 gs.update(wspace=0.35, hspace=0.45)
 
-plot_color_good    = '#22c55e'  # green = good customers
-plot_color_bad     = '#ef4444'  # red   = defaulters
-plot_color_neutral = '#6366f1'  # blue  = neutral
+plot_color_good    = VIZ_COLOR_GOOD
+plot_color_bad     = VIZ_COLOR_BAD
+plot_color_neutral = VIZ_COLOR_NEUTRAL
 
 # ── Plot 1: Target Distribution ────────────────
 ax1 = fig.add_subplot(gs[0, 0])
-ax1.set_facecolor('#1a1a2e')
+ax1.set_facecolor(VIZ_BG_PANEL)
 labels = ['Good (93.32%)', 'Default (6.68%)']
-sizes  = [df['SeriousDlqin2yrs'].value_counts()[0],
-          df['SeriousDlqin2yrs'].value_counts()[1]]
+sizes  = [df[TARGET_COL].value_counts()[0],
+          df[TARGET_COL].value_counts()[1]]
 colors = [plot_color_good, plot_color_bad]
 ax1.pie(sizes, labels=labels, colors=colors,
         autopct='%1.1f%%', startangle=90,
         textprops={'color': 'white', 'fontsize': 10})
 ax1.set_title('Default Rate Distribution\n(Class Imbalance Problem)',
-              color='white', fontsize=11, fontweight='bold')
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
 
 # ── Plot 2: Age vs Default Rate ─────────────────
 ax2 = fig.add_subplot(gs[0, 1])
-ax2.set_facecolor('#1a1a2e')
+ax2.set_facecolor(VIZ_BG_PANEL)
 df_clean = df[df['age'].between(18, 100)].copy()
 age_bins = pd.cut(df_clean['age'],
                    bins=[18,25,35,45,55,65,100],
                    labels=['18-25','26-35','36-45',
                            '46-55','56-65','65+'])
 age_default = df_clean.groupby(
-    age_bins, observed=True)['SeriousDlqin2yrs'].mean() * 100
+    age_bins, observed=True)[TARGET_COL].mean() * 100
 bars = ax2.bar(age_default.index, age_default.values,
                color=plot_color_neutral,
-               edgecolor='white', linewidth=0.5)
+               edgecolor=VIZ_TEXT, linewidth=0.5)
 ax2.set_title('Default Rate by Age Group',
-              color='white', fontsize=11, fontweight='bold')
-ax2.set_xlabel('Age Group', color='white')
-ax2.set_ylabel('Default Rate (%)', color='white')
-ax2.tick_params(colors='white')
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
+ax2.set_xlabel('Age Group', color=VIZ_TEXT)
+ax2.set_ylabel('Default Rate (%)', color=VIZ_TEXT)
+ax2.tick_params(colors=VIZ_TEXT)
 for bar, val in zip(bars, age_default.values):
     ax2.text(bar.get_x() + bar.get_width()/2,
              bar.get_height() + 0.1,
              f'{val:.1f}%', ha='center',
-             color='white', fontsize=9)
+             color=VIZ_TEXT, fontsize=9)
 
 # ── Plot 3: Income vs Default ───────────────────
 ax3 = fig.add_subplot(gs[0, 2])
-ax3.set_facecolor('#1a1a2e')
+ax3.set_facecolor(VIZ_BG_PANEL)
 df_inc = df[df['MonthlyIncome'].between(0, 20000)].copy()
 inc_bins = pd.cut(df_inc['MonthlyIncome'],
                    bins=[0,2000,4000,6000,8000,20000],
                    labels=['<2K','2-4K','4-6K',
                            '6-8K','>8K'])
 inc_default = df_inc.groupby(
-    inc_bins, observed=True)['SeriousDlqin2yrs'].mean() * 100
+    inc_bins, observed=True)[TARGET_COL].mean() * 100
 bars3 = ax3.bar(inc_default.index, inc_default.values,
                 color=plot_color_bad,
-                edgecolor='white', linewidth=0.5)
+                edgecolor=VIZ_TEXT, linewidth=0.5)
 ax3.set_title('Default Rate by Monthly Income',
-              color='white', fontsize=11, fontweight='bold')
-ax3.set_xlabel('Monthly Income ($)', color='white')
-ax3.set_ylabel('Default Rate (%)', color='white')
-ax3.tick_params(colors='white')
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
+ax3.set_xlabel('Monthly Income ($)', color=VIZ_TEXT)
+ax3.set_ylabel('Default Rate (%)', color=VIZ_TEXT)
+ax3.tick_params(colors=VIZ_TEXT)
 for bar, val in zip(bars3, inc_default.values):
     ax3.text(bar.get_x() + bar.get_width()/2,
              bar.get_height() + 0.1,
              f'{val:.1f}%', ha='center',
-             color='white', fontsize=9)
+             color=VIZ_TEXT, fontsize=9)
 
 # ── Plot 4: Credit Utilization vs Default ───────
 ax4 = fig.add_subplot(gs[1, 0])
-ax4.set_facecolor('#1a1a2e')
+ax4.set_facecolor(VIZ_BG_PANEL)
 df_rev = df[df['RevolvingUtilizationOfUnsecuredLines']
             .between(0, 1.5)].copy()
-good = df_rev[df_rev['SeriousDlqin2yrs']==0][
+good = df_rev[df_rev[TARGET_COL]==0][
     'RevolvingUtilizationOfUnsecuredLines']
-bad  = df_rev[df_rev['SeriousDlqin2yrs']==1][
+bad  = df_rev[df_rev[TARGET_COL]==1][
     'RevolvingUtilizationOfUnsecuredLines']
 ax4.hist(good, bins=50, alpha=0.7,
          color=plot_color_good, label='Good', density=True)
 ax4.hist(bad,  bins=50, alpha=0.7,
          color=plot_color_bad,  label='Default', density=True)
 ax4.set_title('Credit Utilization: Good vs Default',
-              color='white', fontsize=11, fontweight='bold')
-ax4.set_xlabel('Credit Utilization Ratio', color='white')
-ax4.set_ylabel('Density', color='white')
-ax4.tick_params(colors='white')
-ax4.legend(facecolor='#1a1a2e', labelcolor='white')
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
+ax4.set_xlabel('Credit Utilization Ratio', color=VIZ_TEXT)
+ax4.set_ylabel('Density', color=VIZ_TEXT)
+ax4.tick_params(colors=VIZ_TEXT)
+ax4.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT)
 
 # ── Plot 5: Late Payments vs Default ────────────
 ax5 = fig.add_subplot(gs[1, 1])
-ax5.set_facecolor('#1a1a2e')
+ax5.set_facecolor(VIZ_BG_PANEL)
 late_default = df.groupby(
     'NumberOfTimes90DaysLate'
-)['SeriousDlqin2yrs'].mean().head(10) * 100
+)[TARGET_COL].mean().head(10) * 100
 ax5.bar(late_default.index, late_default.values,
         color=plot_color_bad,
-        edgecolor='white', linewidth=0.5)
+        edgecolor=VIZ_TEXT, linewidth=0.5)
 ax5.set_title('Default Rate by 90-Days Late Count',
-              color='white', fontsize=11, fontweight='bold')
-ax5.set_xlabel('Number of Times 90 Days Late', color='white')
-ax5.set_ylabel('Default Rate (%)', color='white')
-ax5.tick_params(colors='white')
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
+ax5.set_xlabel('Number of Times 90 Days Late', color=VIZ_TEXT)
+ax5.set_ylabel('Default Rate (%)', color=VIZ_TEXT)
+ax5.tick_params(colors=VIZ_TEXT)
 
 # ── Plot 6: Debt Ratio vs Default ───────────────
 ax6 = fig.add_subplot(gs[1, 2])
-ax6.set_facecolor('#1a1a2e')
+ax6.set_facecolor(VIZ_BG_PANEL)
 df_debt = df[df['DebtRatio'].between(0, 2)].copy()
-good_d = df_debt[df_debt['SeriousDlqin2yrs']==0]['DebtRatio']
-bad_d  = df_debt[df_debt['SeriousDlqin2yrs']==1]['DebtRatio']
+good_d = df_debt[df_debt[TARGET_COL]==0]['DebtRatio']
+bad_d  = df_debt[df_debt[TARGET_COL]==1]['DebtRatio']
 ax6.hist(good_d, bins=50, alpha=0.7,
          color=plot_color_good, label='Good', density=True)
 ax6.hist(bad_d,  bins=50, alpha=0.7,
          color=plot_color_bad,  label='Default', density=True)
 ax6.set_title('Debt Ratio: Good vs Default',
-              color='white', fontsize=11, fontweight='bold')
-ax6.set_xlabel('Debt Ratio', color='white')
-ax6.set_ylabel('Density', color='white')
-ax6.tick_params(colors='white')
-ax6.legend(facecolor='#1a1a2e', labelcolor='white')
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
+ax6.set_xlabel('Debt Ratio', color=VIZ_TEXT)
+ax6.set_ylabel('Density', color=VIZ_TEXT)
+ax6.tick_params(colors=VIZ_TEXT)
+ax6.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT)
 
 # ── Plot 7: Correlation Heatmap ─────────────────
 ax7 = fig.add_subplot(gs[2, :])
-ax7.set_facecolor('#1a1a2e')
+ax7.set_facecolor(VIZ_BG_PANEL)
 corr = df.corr(numeric_only=True)
 mask = np.triu(np.ones_like(corr, dtype=bool))
 sns.heatmap(corr, mask=mask, ax=ax7,
@@ -341,19 +370,17 @@ sns.heatmap(corr, mask=mask, ax=ax7,
             linewidths=0.5,
             cbar_kws={'shrink': 0.8})
 ax7.set_title('Feature Correlation Matrix',
-              color='white', fontsize=12, fontweight='bold')
-ax7.tick_params(colors='white', labelsize=8)
+              color=VIZ_TEXT, fontsize=12, fontweight='bold')
+ax7.tick_params(colors=VIZ_TEXT, labelsize=8)
 
 plt.suptitle('Credit Risk — Exploratory Data Analysis\n'
              'Give Me Some Credit Dataset | 104,619 Applicants',
-             color='white', fontsize=14,
+             color=VIZ_TEXT, fontsize=14,
              fontweight='bold', y=1.01)
 
-plt.savefig('fig1_eda.png', dpi=150,
-            bbox_inches='tight',
-            facecolor='#0f1117')
+save_figure(fig, FIG_EDA, close=False)
 plt.show()
-print("✅ EDA Chart saved as fig1_eda.png")
+logger.info(f'EDA Chart saved as {FIG_EDA}')
 
 # ── Key findings summary ────────────────────────
 print("\n" + "=" * 55)
@@ -366,7 +393,7 @@ print(f"3. Low income (<$2K/month) = highest default risk")
 print(f"4. Higher credit utilization = higher default rate")
 print(f"5. Even 1 instance of 90-days-late = very high risk")
 corr_target = df.corr(
-    numeric_only=True)['SeriousDlqin2yrs'].sort_values(
+    numeric_only=True)[TARGET_COL].sort_values(
     ascending=False)
 print(f"\nTop correlations with Default:")
 print(corr_target.round(3))
@@ -375,474 +402,331 @@ print(corr_target.round(3))
 # In[ ]:
 
 
-# @title
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 # CELL 5: DATA CLEANING
 # Industry Step: Data Preprocessing
 # This is what banks do before ANY modelling
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 
-print("BEFORE CLEANING")
-print(f"Shape: {df.shape}")
-print(f"Missing values: {df.isnull().sum().sum()}")
+print('BEFORE CLEANING')
+print(f'Shape: {df.shape}')
+print(f'Missing values: {df.isnull().sum().sum()}')
 
-# ── Step 1: Remove 1 row with missing target ───
-df = df.dropna(subset=['SeriousDlqin2yrs'])
-df['SeriousDlqin2yrs'] = df['SeriousDlqin2yrs'].astype(int)
-print(f"\n✅ Step 1: Removed rows with missing target")
-print(f"Shape now: {df.shape}")
+# ── Step 1: Remove rows with missing target ────
+df = df.dropna(subset=[TARGET_COL])
+df[TARGET_COL] = df[TARGET_COL].astype(int)
+print(f'\n✅ Step 1: Removed rows with missing target')
+print(f'Shape now: {df.shape}')
 
 # ── Step 2: Fix impossible age values ──────────
-df = df[df['age'].between(18, 100)]
-print(f"\n✅ Step 2: Removed impossible age values")
-print(f"Shape now: {df.shape}")
+df = df[df['age'].between(AGE_MIN, AGE_MAX)]
+print(f'\n✅ Step 2: Removed impossible age values (outside {AGE_MIN}–{AGE_MAX})')
+print(f'Shape now: {df.shape}')
 
-# ── Step 3: Cap extreme outliers ───────────────
-# Winsorization — industry standard technique
-# Cap at 99th percentile instead of removing
-
-# Credit utilization — cap at 1 (100% utilized)
-p99_rev = df['RevolvingUtilizationOfUnsecuredLines'].quantile(0.99)
+# ── Step 3: Cap extreme outliers (Winsorization) ─
+p99_rev = df['RevolvingUtilizationOfUnsecuredLines'].quantile(WINSOR_QUANTILE)
 df['RevolvingUtilizationOfUnsecuredLines'] = df[
     'RevolvingUtilizationOfUnsecuredLines'].clip(0, p99_rev)
-print(f"\n✅ Step 3a: Credit utilization capped at {p99_rev:.3f}")
+print(f'\n✅ Step 3a: Credit utilization capped at {p99_rev:.3f}')
 
-# Debt ratio — cap at 99th percentile
-p99_debt = df['DebtRatio'].quantile(0.99)
+p99_debt = df['DebtRatio'].quantile(WINSOR_QUANTILE)
 df['DebtRatio'] = df['DebtRatio'].clip(0, p99_debt)
-print(f"✅ Step 3b: Debt ratio capped at {p99_debt:.3f}")
+print(f'✅ Step 3b: Debt ratio capped at {p99_debt:.3f}')
 
-# Late payment counts — cap at 10 (data errors above)
-for col in ['NumberOfTime30-59DaysPastDueNotWorse',
-            'NumberOfTimes90DaysLate',
-            'NumberOfTime60-89DaysPastDueNotWorse']:
-    df[col] = df[col].clip(0, 10)
-print(f"✅ Step 3c: Late payment counts capped at 10")
+late_cols = [
+    'NumberOfTime30-59DaysPastDueNotWorse',
+    'NumberOfTimes90DaysLate',
+    'NumberOfTime60-89DaysPastDueNotWorse',
+]
+for col in late_cols:
+    df[col] = df[col].clip(0, LATE_PAYMENT_CAP)
+print(f'✅ Step 3c: Late payment counts capped at {LATE_PAYMENT_CAP}')
 
-# Monthly income — cap at 99th percentile
-p99_inc = df['MonthlyIncome'].quantile(0.99)
+p99_inc = df['MonthlyIncome'].quantile(WINSOR_QUANTILE)
 df['MonthlyIncome'] = df['MonthlyIncome'].clip(0, p99_inc)
-print(f"✅ Step 3d: Monthly income capped at ${p99_inc:,.0f}")
+print(f'✅ Step 3d: Monthly income capped at ${p99_inc:,.0f}')
 
 # ── Step 4: Handle missing values ─────────────
-# MonthlyIncome — 19.79% missing
-# Use MEDIAN by age group (smarter than overall median)
-df['age_group'] = pd.cut(df['age'],
-    bins=[18,35,50,65,100],
-    labels=['Young','Middle','Senior','Elder'])
+# MonthlyIncome — ~20% missing → median by age group (vectorised)
+df['age_group'] = pd.cut(
+    df['age'], bins=AGE_GROUP_BINS, labels=AGE_GROUP_LABELS,
+)
 
-income_medians = df.groupby(
-    'age_group', observed=True)['MonthlyIncome'].median()
-
-print(f"\n✅ Step 4a: Income medians by age group:")
+income_medians = df.groupby('age_group', observed=True)['MonthlyIncome'].median()
+print(f'\n✅ Step 4a: Income medians by age group:')
 print(income_medians)
 
-def fill_income(row):
-    if pd.isnull(row['MonthlyIncome']):
-        return income_medians[row['age_group']]
-    return row['MonthlyIncome']
+# Vectorised fill: groupby transform instead of row-wise apply
+df['MonthlyIncome'] = df['MonthlyIncome'].fillna(
+    df.groupby('age_group', observed=True)['MonthlyIncome'].transform('median')
+)
+print(f'Missing income after fix: {df["MonthlyIncome"].isnull().sum()}')
 
-df['MonthlyIncome'] = df.apply(fill_income, axis=1)
-print(f"Missing income after fix: {df['MonthlyIncome'].isnull().sum()}")
-
-# NumberOfDependents — 2.62% missing → fill with 0
+# NumberOfDependents — ~2.6% missing → fill with 0
 df['NumberOfDependents'] = df['NumberOfDependents'].fillna(0)
-print(f"✅ Step 4b: Dependents missing → filled with 0")
-print(f"Missing dependents after fix: {df['NumberOfDependents'].isnull().sum()}")
+print(f'✅ Step 4b: Dependents missing → filled with 0')
 
 # ── Step 5: Feature Engineering ────────────────
-# Create NEW features banks actually use
+# DTI Ratio
+df['DTI_Ratio'] = df['DebtRatio'] * df['MonthlyIncome'] / df['MonthlyIncome'].replace(0, 1)
 
-# Debt-to-Income Ratio (DTI)
-df['DTI_Ratio'] = df['DebtRatio'] * df['MonthlyIncome'] / df['MonthlyIncome'].replace(0,1)
-
-# Total delinquency score
+# Total delinquency score (weighted)
 df['Total_Delinquency'] = (
-    df['NumberOfTime30-59DaysPastDueNotWorse'] * 1 +
-    df['NumberOfTime60-89DaysPastDueNotWorse'] * 2 +
-    df['NumberOfTimes90DaysLate']              * 3
+    df['NumberOfTime30-59DaysPastDueNotWorse'] * DELINQ_WEIGHT_30
+    + df['NumberOfTime60-89DaysPastDueNotWorse'] * DELINQ_WEIGHT_60
+    + df['NumberOfTimes90DaysLate'] * DELINQ_WEIGHT_90
 )
-# Weight: 30-day late=1pt, 60-day=2pts, 90-day=3pts
 
 # Income per dependent
-df['Income_Per_Dependent'] = df['MonthlyIncome'] / (
-    df['NumberOfDependents'] + 1)
+df['Income_Per_Dependent'] = df['MonthlyIncome'] / (df['NumberOfDependents'] + 1)
 
 # Credit burden ratio
 df['Credit_Burden'] = df['NumberOfOpenCreditLinesAndLoans'] / (
     df['MonthlyIncome'] / 1000 + 1)
 
-print(f"\n✅ Step 5: 4 new features engineered:")
-print(f"  → DTI_Ratio: debt-to-income ratio")
-print(f"  → Total_Delinquency: weighted late payment score")
-print(f"  → Income_Per_Dependent: income per family member")
-print(f"  → Credit_Burden: loans per $1000 income")
+print(f'\n✅ Step 5: 4 new features engineered:')
+print(f'  → DTI_Ratio:            debt-to-income ratio')
+print(f'  → Total_Delinquency:    weighted late payment score')
+print(f'  → Income_Per_Dependent: income per family member')
+print(f'  → Credit_Burden:        loans per $1000 income')
 
 # ── Drop helper columns ────────────────────────
 df = df.drop(columns=['age_group'])
 
 # ── Final check ────────────────────────────────
-print(f"\n{'='*55}")
-print(f"AFTER CLEANING")
-print(f"{'='*55}")
-print(f"Shape:          {df.shape}")
-print(f"Missing values: {df.isnull().sum().sum()}")
-print(f"Default rate:   {df['SeriousDlqin2yrs'].mean()*100:.2f}%")
-print(f"\nFinal columns:")
+print(f'\n{"=" * 60}')
+print(f'AFTER CLEANING')
+print(f'{"=" * 60}')
+print(f'Shape:          {df.shape}')
+print(f'Missing values: {df.isnull().sum().sum()}')
+print(f'Default rate:   {df[TARGET_COL].mean() * 100:.2f}%')
+print(f'\nFinal columns:')
 for col in df.columns:
-    print(f"  → {col}")
+    print(f'  → {col}')
 
-print(f"\n✅ Data cleaning complete! Ready for modelling.")
+print(f'\n✅ Data cleaning complete! Ready for modelling.')
 
 
 # In[ ]:
 
 
-# ═══════════════════════════════════════════════
-# CELL 6: WEIGHT OF EVIDENCE (WoE) &
-#         INFORMATION VALUE (IV)
+# ═══════════════════════════════════════════════════════════════
+# CELL 6: WEIGHT OF EVIDENCE (WoE) & INFORMATION VALUE (IV)
 # Industry Step: Feature Selection & Transformation
 # THIS IS THE MOST IMPORTANT STEP IN BANKING
-# Used by every bank building credit scorecards
-# ═══════════════════════════════════════════════
-
-def calculate_woe_iv(df, feature, target, bins=10):
-    '''
-    Calculate WoE and IV for any feature
-
-    WoE = ln(Distribution of Good / Distribution of Bad)
-    IV  = Sum of (Good% - Bad%) × WoE
-
-    WoE tells: how predictive each bin is
-    IV tells:  how predictive the whole variable is
-    '''
-
-    # Create a working copy
-    temp = df[[feature, target]].copy()
-
-    # Bin continuous variables
-    try:
-        temp['bin'] = pd.qcut(temp[feature],
-                               q=bins,
-                               duplicates='drop')
-    except Exception:
-        temp['bin'] = pd.cut(temp[feature],
-                              bins=bins,
-                              duplicates='drop')
-
-    # Count good and bad in each bin
-    grouped = temp.groupby('bin', observed=True)[target].agg(
-        bad  = 'sum',
-        good = lambda x: (x == 0).sum(),
-        total= 'count'
-    ).reset_index()
-
-    # Total goods and bads in dataset
-    total_bad  = grouped['bad'].sum()
-    total_good = grouped['good'].sum()
-
-    # Distribution of goods and bads per bin
-    grouped['dist_bad']  = grouped['bad']  / total_bad
-    grouped['dist_good'] = grouped['good'] / total_good
-
-    # Replace zeros to avoid log(0) error
-    grouped['dist_bad']  = grouped['dist_bad'].replace(0, 0.0001)
-    grouped['dist_good'] = grouped['dist_good'].replace(0, 0.0001)
-
-    # WoE calculation
-    grouped['WoE'] = np.log(grouped['dist_good'] /
-                             grouped['dist_bad'])
-
-    # IV calculation per bin
-    grouped['IV_bin'] = (grouped['dist_good'] -
-                          grouped['dist_bad']) * grouped['WoE']
-
-    # Total IV for this feature
-    iv_total = grouped['IV_bin'].sum()
-
-    # Default rate per bin
-    grouped['default_rate'] = grouped['bad'] / grouped['total'] * 100
-
-    return grouped, iv_total
-
+# ═══════════════════════════════════════════════════════════════
 
 # ── Calculate IV for all features ─────────────
-features_to_test = [
-    'RevolvingUtilizationOfUnsecuredLines',
-    'age',
-    'NumberOfTime30-59DaysPastDueNotWorse',
-    'DebtRatio',
-    'MonthlyIncome',
-    'NumberOfOpenCreditLinesAndLoans',
-    'NumberOfTimes90DaysLate',
-    'NumberRealEstateLoansOrLines',
-    'NumberOfTime60-89DaysPastDueNotWorse',
-    'NumberOfDependents',
-    'DTI_Ratio',
-    'Total_Delinquency',
-    'Income_Per_Dependent',
-    'Credit_Burden'
-]
-
-target = 'SeriousDlqin2yrs'
-
 iv_results = []
 woe_tables = {}
 
-print("Calculating WoE and IV for all features...")
-print("=" * 55)
+print('Calculating WoE and IV for all features...')
+print('=' * 60)
 
-for feature in features_to_test:
+for feature in FEATURES_FOR_IV:
     try:
-        woe_table, iv = calculate_woe_iv(df, feature, target)
+        woe_table, iv = calculate_woe_iv(df, feature, TARGET_COL)
         iv_results.append({
             'Feature':  feature,
             'IV':       round(iv, 4),
         })
         woe_tables[feature] = woe_table
     except Exception as e:
-        print(f"Error for {feature}: {e}")
+        logger.warning(f'WoE error for {feature}: {e}')
 
 # ── IV Summary Table ───────────────────────────
 iv_df = pd.DataFrame(iv_results).sort_values(
     'IV', ascending=False).reset_index(drop=True)
 
-# Add predictive power label
-def iv_label(iv):
-    if iv < 0.02:   return '❌ Useless'
-    elif iv < 0.1:  return '⚠️  Weak'
-    elif iv < 0.3:  return '✅ Medium'
-    elif iv < 0.5:  return '💪 Strong'
-    else:           return '🏆 Very Strong'
+iv_df['Predictive Power'] = iv_df['IV'].apply(classify_iv)
 
-iv_df['Predictive Power'] = iv_df['IV'].apply(iv_label)
-
-print("\nINFORMATION VALUE RESULTS")
-print("=" * 55)
+print('\nINFORMATION VALUE RESULTS')
+print('=' * 60)
 print(iv_df.to_string(index=False))
 
-print("\n" + "=" * 55)
-print("FEATURES SELECTED FOR MODEL (IV >= 0.1)")
-print("=" * 55)
-selected = iv_df[iv_df['IV'] >= 0.02]['Feature'].tolist()
+print('\n' + '=' * 60)
+print(f'FEATURES SELECTED FOR MODEL (IV >= {IV_MIN_THRESHOLD})')
+print('=' * 60)
+selected = iv_df[iv_df['IV'] >= IV_MIN_THRESHOLD]['Feature'].tolist()
 for f in selected:
-    print(f"  ✅ {f}")
+    print(f'  ✅ {f}')
 
-print(f"\nTotal features selected: {len(selected)}")
+print(f'\nTotal features selected: {len(selected)}')
 
-# ── WoE Visualization ─────────────────────────
-# Show WoE chart for top 6 features
+# ── WoE Visualisation ─────────────────────────
 top_features = iv_df.head(6)['Feature'].tolist()
 
 fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-fig.patch.set_facecolor('#0f1117')
+fig.patch.set_facecolor(VIZ_BG_DARK)
 axes = axes.flatten()
 
 for idx, feature in enumerate(top_features):
     ax = axes[idx]
-    ax.set_facecolor('#1a1a2e')
+    ax.set_facecolor(VIZ_BG_PANEL)
 
     woe_data = woe_tables[feature]
 
-    # Color bars by WoE sign
-    colors = ['#22c55e' if w >= 0 else '#ef4444'
-              for w in woe_data['WoE']]
+    colors = [VIZ_COLOR_GOOD if w >= 0 else VIZ_COLOR_BAD
+              for w in woe_data['woe']]
 
     bars = ax.bar(range(len(woe_data)),
-                  woe_data['WoE'],
+                  woe_data['woe'],
                   color=colors,
-                  edgecolor='white',
+                  edgecolor=VIZ_TEXT,
                   linewidth=0.5)
 
-    ax.axhline(y=0, color='white',
-               linewidth=1, linestyle='--')
-    ax.set_title(f'{feature[:30]}\nIV = {woe_tables[feature]["IV_bin"].sum():.4f}',
-                 color='white', fontsize=9, fontweight='bold')
-    ax.set_xlabel('Bins', color='white', fontsize=8)
-    ax.set_ylabel('WoE', color='white', fontsize=8)
-    ax.tick_params(colors='white', labelsize=7)
+    ax.axhline(y=0, color=VIZ_TEXT, linewidth=1, linestyle='--')
+    style_axis(
+        ax,
+        title=f'{feature[:30]}\nIV = {woe_data["iv"].sum():.4f}',
+        xlabel='Bins', ylabel='WoE',
+    )
+    ax.tick_params(labelsize=7)
 
-    # Add default rate on each bar
-    for i, (bar, dr) in enumerate(zip(bars, woe_data['default_rate'])):
-        ax.text(bar.get_x() + bar.get_width()/2,
-                bar.get_height() + 0.01,
-                f'{dr:.1f}%',
-                ha='center', va='bottom',
-                color='white', fontsize=7)
-
-plt.suptitle('Weight of Evidence (WoE) Analysis\n'
-             'Green = Good signal | Red = Bad signal | '
-             '% = Default rate per bin',
-             color='white', fontsize=12,
-             fontweight='bold')
+plt.suptitle(
+    'Weight of Evidence (WoE) Analysis\n'
+    'Green = Good signal │ Red = Bad signal',
+    color=VIZ_TEXT, fontsize=12, fontweight='bold',
+)
 
 plt.tight_layout()
-plt.savefig('fig2_woe.png', dpi=150,
-            bbox_inches='tight',
-            facecolor='#0f1117')
+save_figure(fig, FIG_WOE, close=False)
 plt.show()
-print("✅ WoE chart saved as fig2_woe.png")
+logger.info(f'WoE chart saved as {FIG_WOE}')
 
 
 # In[ ]:
 
 
-# ═══════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
 # CELL 7: PROBABILITY OF DEFAULT (PD) MODEL
 # Industry Step: Model Development
 # Algorithm: Logistic Regression (Basel standard)
-# ═══════════════════════════════════════════════
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
-from sklearn.metrics import (roc_auc_score, roc_curve,
-                              confusion_matrix,
-                              classification_report,
-                              precision_recall_curve,
-                              average_precision_score)
-from sklearn.preprocessing import StandardScaler
-from imblearn.over_sampling import SMOTE
-import shap
+# ═══════════════════════════════════════════════════════════════
 
 # ── Step 1: Prepare features ───────────────────
-selected_features = [
-    'Total_Delinquency',
-    'RevolvingUtilizationOfUnsecuredLines',
-    'NumberOfTime30-59DaysPastDueNotWorse',
-    'age',
-    'Income_Per_Dependent',
-    'MonthlyIncome',
-    'DebtRatio',
-    'DTI_Ratio',
-    'NumberOfOpenCreditLinesAndLoans',
-    'Credit_Burden',
-    'NumberOfDependents'
-]
+X = df[SELECTED_FEATURES].copy()
+y = df[TARGET_COL].copy()
 
-X = df[selected_features].copy()
-y = df['SeriousDlqin2yrs'].copy()
-
-print("=" * 55)
-print("STEP 1: DATA PREPARATION")
-print("=" * 55)
-print(f"Features selected: {len(selected_features)}")
-print(f"Total samples:     {len(X):,}")
-print(f"Default rate:      {y.mean()*100:.2f}%")
+print('=' * 60)
+print('STEP 1: DATA PREPARATION')
+print('=' * 60)
+print(f'Features selected: {len(SELECTED_FEATURES)}')
+print(f'Total samples:     {len(X):,}')
+print(f'Default rate:      {y.mean() * 100:.2f}%')
 
 # ── Step 2: Train/Test Split ───────────────────
-# Stratified split preserves default rate in both sets
 X_train, X_test, y_train, y_test = train_test_split(
     X, y,
-    test_size=0.2,      # 80% train, 20% test
-    random_state=42,    # reproducibility
-    stratify=y          # preserve class ratio
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE,
+    stratify=y,
 )
 
-print(f"\n{'='*55}")
-print(f"STEP 2: TRAIN/TEST SPLIT")
-print(f"{'='*55}")
-print(f"Training set:   {len(X_train):,} samples")
-print(f"Test set:       {len(X_test):,} samples")
-print(f"Train default%: {y_train.mean()*100:.2f}%")
-print(f"Test default%:  {y_test.mean()*100:.2f}%")
+print(f'\n{"=" * 60}')
+print('STEP 2: TRAIN/TEST SPLIT')
+print(f'{"=" * 60}')
+print(f'Training set:   {len(X_train):,} samples')
+print(f'Test set:       {len(X_test):,} samples')
+print(f'Train default%: {y_train.mean() * 100:.2f}%')
+print(f'Test default%:  {y_test.mean() * 100:.2f}%')
 
 # ── Step 3: Handle Class Imbalance with SMOTE ──
-print(f"\n{'='*55}")
-print(f"STEP 3: SMOTE — HANDLING CLASS IMBALANCE")
-print(f"{'='*55}")
-print(f"Before SMOTE:")
-print(f"  Good (0): {(y_train==0).sum():,}")
-print(f"  Bad  (1): {(y_train==1).sum():,}")
-print(f"  Ratio:    {(y_train==0).sum()/(y_train==1).sum():.1f}:1")
+print(f'\n{"=" * 60}')
+print('STEP 3: SMOTE — HANDLING CLASS IMBALANCE')
+print(f'{"=" * 60}')
+print(f'Before SMOTE:')
+print(f'  Good (0): {(y_train == 0).sum():,}')
+print(f'  Bad  (1): {(y_train == 1).sum():,}')
+print(f'  Ratio:    {(y_train == 0).sum() / (y_train == 1).sum():.1f}:1')
 
-smote = SMOTE(random_state=42, k_neighbors=5)
+smote = SMOTE(random_state=RANDOM_STATE, k_neighbors=SMOTE_K_NEIGHBORS)
 X_train_bal, y_train_bal = smote.fit_resample(X_train, y_train)
 
-print(f"\nAfter SMOTE:")
-print(f"  Good (0): {(y_train_bal==0).sum():,}")
-print(f"  Bad  (1): {(y_train_bal==1).sum():,}")
-print(f"  Ratio:    1:1 (perfectly balanced)")
+print(f'\nAfter SMOTE:')
+print(f'  Good (0): {(y_train_bal == 0).sum():,}')
+print(f'  Bad  (1): {(y_train_bal == 1).sum():,}')
+print(f'  Ratio:    1:1 (perfectly balanced)')
 
 # ── Step 4: Feature Scaling ────────────────────
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train_bal)
 X_test_scaled  = scaler.transform(X_test)
 
-print(f"\n✅ Step 4: StandardScaler applied")
-print(f"  Logistic Regression requires scaled features")
+print(f'\n✅ Step 4: StandardScaler applied')
 
 # ── Step 5: Train Logistic Regression ──────────
-print(f"\n{'='*55}")
-print(f"STEP 5: TRAINING LOGISTIC REGRESSION MODEL")
-print(f"{'='*55}")
+print(f'\n{"=" * 60}')
+print('STEP 5: TRAINING LOGISTIC REGRESSION MODEL')
+print(f'{"=" * 60}')
 
 lr_model = LogisticRegression(
-    C=1.0,              # regularization strength
-    max_iter=1000,      # enough iterations to converge
-    random_state=42,
-    class_weight=None   # SMOTE already balanced
+    C=LR_C,
+    max_iter=LR_MAX_ITER,
+    random_state=RANDOM_STATE,
+    class_weight=None,   # SMOTE already balanced
 )
 
 lr_model.fit(X_train_scaled, y_train_bal)
-print("✅ Model trained successfully!")
+logger.info('Model trained successfully')
 
 # ── Step 6: Predictions ────────────────────────
 y_pred_proba = lr_model.predict_proba(X_test_scaled)[:, 1]
+y_pred_class = (y_pred_proba >= CLASSIFICATION_THRESHOLD).astype(int)
 
-# Custom threshold to improve default detection
-threshold = 0.30
-
-y_pred_class = (y_pred_proba >= threshold).astype(int)
-
-print(f"Using probability threshold: {threshold}")
+print(f'Using probability threshold: {CLASSIFICATION_THRESHOLD}')
 
 # ── Step 7: Model Evaluation ───────────────────
-print(f"\n{'='*55}")
-print(f"STEP 6: MODEL EVALUATION")
-print(f"{'='*55}")
+print(f'\n{"=" * 60}')
+print('STEP 6: MODEL EVALUATION')
+print(f'{"=" * 60}')
 
-# AUC-ROC
+# Core metrics
 auc_roc = roc_auc_score(y_test, y_pred_proba)
-
-# Gini (industry standard for credit risk)
-gini = 2 * auc_roc - 1
+gini = compute_gini(auc_roc)
+brier = brier_score_loss(y_test, y_pred_proba)
+logloss = log_loss(y_test, y_pred_proba)
+ks_stat, ks_thresh = compute_ks_statistic(y_test.values, y_pred_proba)
 
 # Cross validation
-cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-cv_scores = cross_val_score(lr_model, X_test_scaled,
-                             y_test, cv=cv,
-                             scoring='roc_auc')
+cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+cv_scores = cross_val_score(
+    lr_model, X_test_scaled, y_test, cv=cv, scoring='roc_auc',
+)
 
-print(f"AUC-ROC Score:      {auc_roc:.4f}")
-print(f"Gini Coefficient:   {gini:.4f}")
-print(f"CV AUC (5-fold):    {cv_scores.mean():.4f} "
-      f"(±{cv_scores.std():.4f})")
-print(f"\nClassification Report:")
+print(f'AUC-ROC Score:      {auc_roc:.4f}')
+print(f'Gini Coefficient:   {gini:.4f}')
+print(f'Brier Score:        {brier:.4f}')
+print(f'Log-Loss:           {logloss:.4f}')
+print(f'KS Statistic:       {ks_stat:.4f} (at threshold {ks_thresh:.4f})')
+print(f'CV AUC ({CV_FOLDS}-fold):    {cv_scores.mean():.4f} '
+      f'(±{cv_scores.std():.4f})')
+print(f'\nClassification Report:')
 print(classification_report(y_test, y_pred_class,
-      target_names=['Good','Default']))
+      target_names=['Good', 'Default']))
 
-# Confusion Matrix numbers
+# Confusion Matrix
 cm = confusion_matrix(y_test, y_pred_class)
 tn, fp, fn, tp = cm.ravel()
-print(f"\nConfusion Matrix:")
-print(f"  True Negatives  (correctly identified good): {tn:,}")
-print(f"  False Positives (good marked as default):    {fp:,}")
-print(f"  False Negatives (missed defaults):           {fn:,}")
-print(f"  True Positives  (correctly caught defaults): {tp:,}")
-print(f"\nBusiness Impact:")
-print(f"  Defaults caught:  {tp/(tp+fn)*100:.1f}% (Recall)")
-print(f"  False alarms:     {fp/(fp+tn)*100:.1f}% of good customers rejected")
+print(f'\nConfusion Matrix:')
+print(f'  True Negatives  (correctly identified good): {tn:,}')
+print(f'  False Positives (good marked as default):    {fp:,}')
+print(f'  False Negatives (missed defaults):           {fn:,}')
+print(f'  True Positives  (correctly caught defaults): {tp:,}')
+print(f'\nBusiness Impact:')
+print(f'  Defaults caught:  {tp / (tp + fn) * 100:.1f}% (Recall)')
+print(f'  False alarms:     {fp / (fp + tn) * 100:.1f}% of good customers rejected')
 
 # ── Step 8: Feature Importance (Coefficients) ──
-print(f"\n{'='*55}")
-print(f"MODEL COEFFICIENTS (Feature Importance)")
-print(f"{'='*55}")
+print(f'\n{"=" * 60}')
+print('MODEL COEFFICIENTS (Feature Importance)')
+print(f'{"=" * 60}')
 coef_df = pd.DataFrame({
-    'Feature':     selected_features,
+    'Feature':     SELECTED_FEATURES,
     'Coefficient': lr_model.coef_[0],
-    'Abs_Coef':    abs(lr_model.coef_[0])
+    'Abs_Coef':    abs(lr_model.coef_[0]),
 }).sort_values('Abs_Coef', ascending=False)
-print(coef_df[['Feature','Coefficient']].to_string(index=False))
+print(coef_df[['Feature', 'Coefficient']].to_string(index=False))
 
 
 # In[ ]:
@@ -855,53 +739,50 @@ print(coef_df[['Feature','Coefficient']].to_string(index=False))
 # ═══════════════════════════════════════════════
 
 fig = plt.figure(figsize=(20, 15))
-fig.patch.set_facecolor('#0f1117')
+fig.patch.set_facecolor(VIZ_BG_DARK)
 gs  = gridspec.GridSpec(3, 3, figure=fig)
 gs.update(wspace=0.35, hspace=0.45)
 
 # ── Plot 1: ROC Curve ──────────────────────────
 ax1 = fig.add_subplot(gs[0, 0])
-ax1.set_facecolor('#1a1a2e')
+ax1.set_facecolor(VIZ_BG_PANEL)
 
 fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
-ax1.plot(fpr, tpr, color='#22c55e', linewidth=2.5,
+ax1.plot(fpr, tpr, color=VIZ_COLOR_GOOD, linewidth=2.5,
          label=f'PD Model (AUC = {auc_roc:.4f})')
-ax1.plot([0,1], [0,1], color='#6366f1',
+ax1.plot([0, 1], [0, 1], color=VIZ_COLOR_NEUTRAL,
          linewidth=1, linestyle='--', label='Random (AUC=0.5)')
-ax1.fill_between(fpr, tpr, alpha=0.1, color='#22c55e')
-ax1.set_title('ROC Curve — PD Model',
-              color='white', fontsize=11, fontweight='bold')
-ax1.set_xlabel('False Positive Rate', color='white')
-ax1.set_ylabel('True Positive Rate', color='white')
-ax1.tick_params(colors='white')
-ax1.legend(facecolor='#1a1a2e', labelcolor='white', fontsize=9)
+ax1.fill_between(fpr, tpr, alpha=0.1, color=VIZ_COLOR_GOOD)
+style_axis(ax1, title='ROC Curve — PD Model',
+           xlabel='False Positive Rate', ylabel='True Positive Rate')
+ax1.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT, fontsize=9)
 ax1.text(0.6, 0.2, f'Gini = {gini:.4f}',
-         color='#f59e0b', fontsize=12, fontweight='bold',
+         color=VIZ_COLOR_ACCENT, fontsize=12, fontweight='bold',
          transform=ax1.transAxes)
 
 # ── Plot 2: Precision-Recall Curve ────────────
 ax2 = fig.add_subplot(gs[0, 1])
-ax2.set_facecolor('#1a1a2e')
+ax2.set_facecolor(VIZ_BG_PANEL)
 
 precision_vals, recall_vals, _ = precision_recall_curve(
     y_test, y_pred_proba)
 ap_score = average_precision_score(y_test, y_pred_proba)
 ax2.plot(recall_vals, precision_vals,
-         color='#f59e0b', linewidth=2.5,
+         color=VIZ_COLOR_ACCENT, linewidth=2.5,
          label=f'AP Score = {ap_score:.4f}')
-ax2.axhline(y=y_test.mean(), color='#ef4444',
+ax2.axhline(y=y_test.mean(), color=VIZ_COLOR_BAD,
             linestyle='--', linewidth=1,
             label=f'Baseline = {y_test.mean():.3f}')
 ax2.set_title('Precision-Recall Curve',
-              color='white', fontsize=11, fontweight='bold')
-ax2.set_xlabel('Recall', color='white')
-ax2.set_ylabel('Precision', color='white')
-ax2.tick_params(colors='white')
-ax2.legend(facecolor='#1a1a2e', labelcolor='white', fontsize=9)
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
+ax2.set_xlabel('Recall', color=VIZ_TEXT)
+ax2.set_ylabel('Precision', color=VIZ_TEXT)
+ax2.tick_params(colors=VIZ_TEXT)
+ax2.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT, fontsize=9)
 
 # ── Plot 3: Confusion Matrix ───────────────────
 ax3 = fig.add_subplot(gs[0, 2])
-ax3.set_facecolor('#1a1a2e')
+ax3.set_facecolor(VIZ_BG_PANEL)
 
 cm = confusion_matrix(y_test, y_pred_class)
 cm_pct = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
@@ -909,46 +790,46 @@ cm_pct = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
 im = ax3.imshow(cm_pct, interpolation='nearest',
                 cmap='RdYlGn')
 ax3.set_title('Confusion Matrix (%)',
-              color='white', fontsize=11, fontweight='bold')
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
 
 labels = ['Good', 'Default']
 tick_marks = np.arange(len(labels))
 ax3.set_xticks(tick_marks)
 ax3.set_yticks(tick_marks)
 ax3.set_xticklabels(['Predicted\nGood',
-                      'Predicted\nDefault'], color='white')
+                      'Predicted\nDefault'], color=VIZ_TEXT)
 ax3.set_yticklabels(['Actual\nGood',
-                      'Actual\nDefault'], color='white')
+                      'Actual\nDefault'], color=VIZ_TEXT)
 
 # Add numbers to cells
 for i in range(2):
     for j in range(2):
         ax3.text(j, i, f'{cm[i,j]:,}\n({cm_pct[i,j]:.1f}%)',
                  ha='center', va='center',
-                 color='white', fontsize=10,
+                 color=VIZ_TEXT, fontsize=10,
                  fontweight='bold')
 
 # ── Plot 4: Score Distribution ─────────────────
 ax4 = fig.add_subplot(gs[1, 0])
-ax4.set_facecolor('#1a1a2e')
+ax4.set_facecolor(VIZ_BG_PANEL)
 
 scores_good    = y_pred_proba[y_test == 0]
 scores_default = y_pred_proba[y_test == 1]
 
 ax4.hist(scores_good, bins=50, alpha=0.7,
-         color='#22c55e', label='Good', density=True)
+         color=VIZ_COLOR_GOOD, label='Good', density=True)
 ax4.hist(scores_default, bins=50, alpha=0.7,
-         color='#ef4444', label='Default', density=True)
+         color=VIZ_COLOR_BAD, label='Default', density=True)
 ax4.set_title('PD Score Distribution\nGood vs Default',
-              color='white', fontsize=11, fontweight='bold')
-ax4.set_xlabel('Predicted Default Probability', color='white')
-ax4.set_ylabel('Density', color='white')
-ax4.tick_params(colors='white')
-ax4.legend(facecolor='#1a1a2e', labelcolor='white')
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
+ax4.set_xlabel('Predicted Default Probability', color=VIZ_TEXT)
+ax4.set_ylabel('Density', color=VIZ_TEXT)
+ax4.tick_params(colors=VIZ_TEXT)
+ax4.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT)
 
 # ── Plot 5: KS Statistic ───────────────────────
 ax5 = fig.add_subplot(gs[1, 1])
-ax5.set_facecolor('#1a1a2e')
+ax5.set_facecolor(VIZ_BG_PANEL)
 
 # KS = max separation between good and bad distributions
 thresholds_ks   = np.sort(y_pred_proba)
@@ -962,133 +843,135 @@ ks_threshold = thresholds_ks[
     np.argmax(np.abs(good_cumulative - bad_cumulative))]
 
 ax5.plot(thresholds_ks, good_cumulative,
-         color='#22c55e', linewidth=2, label='Good CDF')
+         color=VIZ_COLOR_GOOD, linewidth=2, label='Good CDF')
 ax5.plot(thresholds_ks, bad_cumulative,
-         color='#ef4444', linewidth=2, label='Default CDF')
-ax5.axvline(x=ks_threshold, color='#f59e0b',
+         color=VIZ_COLOR_BAD, linewidth=2, label='Default CDF')
+ax5.axvline(x=ks_threshold, color=VIZ_COLOR_ACCENT,
             linestyle='--', linewidth=1.5,
             label=f'KS = {ks_statistic:.4f}')
 ax5.set_title(f'KS Statistic = {ks_statistic:.4f}',
-              color='white', fontsize=11, fontweight='bold')
-ax5.set_xlabel('Default Probability Threshold', color='white')
-ax5.set_ylabel('Cumulative Distribution', color='white')
-ax5.tick_params(colors='white')
-ax5.legend(facecolor='#1a1a2e', labelcolor='white', fontsize=9)
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
+ax5.set_xlabel('Default Probability Threshold', color=VIZ_TEXT)
+ax5.set_ylabel('Cumulative Distribution', color=VIZ_TEXT)
+ax5.tick_params(colors=VIZ_TEXT)
+ax5.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT, fontsize=9)
 
 # ── Plot 6: Feature Coefficients ──────────────
 ax6 = fig.add_subplot(gs[1, 2])
-ax6.set_facecolor('#1a1a2e')
+ax6.set_facecolor(VIZ_BG_PANEL)
 
 coef_sorted = coef_df.sort_values('Coefficient')
-colors_coef = ['#ef4444' if c > 0 else '#22c55e'
+colors_coef = [VIZ_COLOR_BAD if c > 0 else VIZ_COLOR_GOOD
                for c in coef_sorted['Coefficient']]
 bars = ax6.barh(range(len(coef_sorted)),
                 coef_sorted['Coefficient'],
                 color=colors_coef,
-                edgecolor='white', linewidth=0.5)
+                edgecolor=VIZ_TEXT, linewidth=0.5)
 ax6.set_yticks(range(len(coef_sorted)))
 ax6.set_yticklabels([f[:25] for f in coef_sorted['Feature']],
-                     color='white', fontsize=8)
-ax6.axvline(x=0, color='white', linewidth=1)
+                     color=VIZ_TEXT, fontsize=8)
+ax6.axvline(x=0, color=VIZ_TEXT, linewidth=1)
 ax6.set_title('Model Coefficients\n'
               'Red=increases risk | Green=decreases risk',
-              color='white', fontsize=10, fontweight='bold')
-ax6.set_xlabel('Coefficient Value', color='white')
-ax6.tick_params(colors='white')
+              color=VIZ_TEXT, fontsize=10, fontweight='bold')
+ax6.set_xlabel('Coefficient Value', color=VIZ_TEXT)
+ax6.tick_params(colors=VIZ_TEXT)
 
 # ── Plot 7: Calibration Curve ──────────────────
 ax7 = fig.add_subplot(gs[2, 0])
-ax7.set_facecolor('#1a1a2e')
+ax7.set_facecolor(VIZ_BG_PANEL)
 
 fraction_pos, mean_pred = calibration_curve(
     y_test, y_pred_proba, n_bins=10)
 ax7.plot(mean_pred, fraction_pos,
-         color='#22c55e', marker='o',
+         color=VIZ_COLOR_GOOD, marker='o',
          linewidth=2, markersize=8, label='PD Model')
-ax7.plot([0,1], [0,1], color='#6366f1',
+ax7.plot([0,1], [0,1], color=VIZ_COLOR_NEUTRAL,
          linestyle='--', linewidth=1, label='Perfect calibration')
 ax7.set_title('Calibration Curve\n'
               'How well PD scores match actual defaults',
-              color='white', fontsize=10, fontweight='bold')
-ax7.set_xlabel('Mean Predicted Probability', color='white')
-ax7.set_ylabel('Fraction of Positives', color='white')
-ax7.tick_params(colors='white')
-ax7.legend(facecolor='#1a1a2e', labelcolor='white', fontsize=9)
+              color=VIZ_TEXT, fontsize=10, fontweight='bold')
+ax7.set_xlabel('Mean Predicted Probability', color=VIZ_TEXT)
+ax7.set_ylabel('Fraction of Positives', color=VIZ_TEXT)
+ax7.tick_params(colors=VIZ_TEXT)
+ax7.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT, fontsize=9)
 
 # ── Plot 8: Cross Validation Scores ───────────
 ax8 = fig.add_subplot(gs[2, 1])
-ax8.set_facecolor('#1a1a2e')
+ax8.set_facecolor(VIZ_BG_PANEL)
 
 fold_numbers = [f'Fold {i+1}' for i in range(len(cv_scores))]
-bar_colors   = ['#22c55e' if s > 0.80 else '#f59e0b'
+bar_colors   = [VIZ_COLOR_GOOD if s > 0.80 else VIZ_COLOR_ACCENT
                 for s in cv_scores]
 bars8 = ax8.bar(fold_numbers, cv_scores,
                 color=bar_colors,
-                edgecolor='white', linewidth=0.5)
-ax8.axhline(y=cv_scores.mean(), color='#ef4444',
+                edgecolor=VIZ_TEXT, linewidth=0.5)
+ax8.axhline(y=cv_scores.mean(), color=VIZ_COLOR_BAD,
             linestyle='--', linewidth=2,
             label=f'Mean = {cv_scores.mean():.4f}')
 ax8.set_title('5-Fold Cross Validation AUC\n'
               'Consistency check across data splits',
-              color='white', fontsize=10, fontweight='bold')
-ax8.set_ylabel('AUC-ROC Score', color='white')
-ax8.tick_params(colors='white')
-ax8.legend(facecolor='#1a1a2e', labelcolor='white')
+              color=VIZ_TEXT, fontsize=10, fontweight='bold')
+ax8.set_ylabel('AUC-ROC Score', color=VIZ_TEXT)
+ax8.tick_params(colors=VIZ_TEXT)
+ax8.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT)
 ax8.set_ylim(0.7, 0.95)
 for bar, val in zip(bars8, cv_scores):
     ax8.text(bar.get_x() + bar.get_width()/2,
              bar.get_height() + 0.002,
              f'{val:.4f}', ha='center',
-             color='white', fontsize=9)
+             color=VIZ_TEXT, fontsize=9)
 
 # ── Plot 9: Performance Summary Card ──────────
 ax9 = fig.add_subplot(gs[2, 2])
-ax9.set_facecolor('#1a1a2e')
+ax9.set_facecolor(VIZ_BG_PANEL)
 ax9.axis('off')
 
 metrics_summary = [
-    ('AUC-ROC',         f'{auc_roc:.4f}',   '🏆'),
-    ('Gini Coeff.',     f'{gini:.4f}',       '💪'),
-    ('KS Statistic',    f'{ks_statistic:.4f}','✅'),
-    ('Recall (Default)',f'{tp/(tp+fn)*100:.1f}%', '🎯'),
-    ('Precision',       f'{tp/(tp+fp)*100:.1f}%', '📊'),
+    ('AUC-ROC',         f'{auc_roc:.4f}',      '🏆'),
+    ('Gini Coeff.',     f'{gini:.4f}',          '💪'),
+    ('KS Statistic',    f'{ks_stat:.4f}',       '✅'),
+    ('Brier Score',     f'{brier:.4f}',         '📐'),
+    ('Log-Loss',        f'{logloss:.4f}',       '📉'),
+    ('Recall (Default)',f'{tp/(tp+fn)*100:.1f}%','🎯'),
+    ('Precision',       f'{tp/(tp+fp)*100:.1f}%','📊'),
     ('CV AUC Mean',     f'{cv_scores.mean():.4f}','🔄'),
-    ('Training samples',f'{len(X_train_bal):,}',  '📈'),
-    ('Test samples',    f'{len(X_test):,}',        '🧪'),
+    ('Training samples',f'{len(X_train_bal):,}', '📈'),
+    ('Test samples',    f'{len(X_test):,}',      '🧪'),
 ]
 
 ax9.text(0.5, 0.97, 'MODEL PERFORMANCE SUMMARY',
          ha='center', va='top',
-         color='#f59e0b', fontsize=11,
+         color=VIZ_COLOR_ACCENT, fontsize=11,
          fontweight='bold',
          transform=ax9.transAxes)
 
 for i, (metric, value, emoji) in enumerate(metrics_summary):
-    y_pos = 0.85 - i * 0.10
+    y_pos = 0.87 - i * 0.085
     ax9.text(0.05, y_pos, f'{emoji} {metric}:',
-             color='white', fontsize=9,
+             color=VIZ_TEXT, fontsize=9,
              transform=ax9.transAxes)
-    ax9.text(0.75, y_pos, value,
-             color='#22c55e', fontsize=9,
+    ax9.text(0.72, y_pos, value,
+             color=VIZ_COLOR_GOOD, fontsize=9,
              fontweight='bold',
              transform=ax9.transAxes)
 
 plt.suptitle('Credit Risk PD Model — Validation Report\n'
              f'Logistic Regression | AUC={auc_roc:.4f} | '
-             f'Gini={gini:.4f} | KS={ks_statistic:.4f}',
-             color='white', fontsize=13,
+             f'Gini={gini:.4f} | KS={ks_stat:.4f}',
+             color=VIZ_TEXT, fontsize=13,
              fontweight='bold', y=1.01)
 
-plt.savefig('fig3_model_performance.png', dpi=150,
-            bbox_inches='tight',
-            facecolor='#0f1117')
+save_figure(fig, FIG_MODEL, close=False)
 plt.show()
-print("✅ Model performance chart saved!")
-print(f"\n🏆 FINAL MODEL METRICS:")
-print(f"   AUC-ROC:  {auc_roc:.4f} (Industry standard: >0.75)")
-print(f"   Gini:     {gini:.4f} (Industry standard: >0.60)")
-print(f"   KS Stat:  {ks_statistic:.4f} (Industry standard: >0.30)")
-print(f"   Recall:   {tp/(tp+fn)*100:.1f}% defaults caught")
+logger.info(f'Model performance chart saved as {FIG_MODEL}')
+print(f'\n🏆 FINAL MODEL METRICS:')
+print(f'   AUC-ROC:     {auc_roc:.4f}  (Industry standard: >0.75)')
+print(f'   Gini:        {gini:.4f}  (Industry standard: >0.60)')
+print(f'   KS Stat:     {ks_stat:.4f}  (Industry standard: >0.30)')
+print(f'   Brier Score: {brier:.4f}  (Lower is better)')
+print(f'   Log-Loss:    {logloss:.4f}')
+print(f'   Recall:      {tp / (tp + fn) * 100:.1f}% defaults caught')
 
 
 # In[ ]:
@@ -1194,7 +1077,7 @@ print("=" * 55)
 # Calculate SHAP values
 explainer   = shap.LinearExplainer(
     lr_model, X_train_scaled,
-    feature_names=selected_features)
+    feature_names=SELECTED_FEATURES)
 shap_values = explainer.shap_values(X_test_scaled)
 
 print("✅ SHAP values calculated!")
@@ -1202,32 +1085,32 @@ print(f"   Shape: {shap_values.shape}")
 
 # ── Visualize SHAP ─────────────────────────────
 fig, axes = plt.subplots(1, 2, figsize=(18, 8))
-fig.patch.set_facecolor('#0f1117')
+fig.patch.set_facecolor(VIZ_BG_DARK)
 
 # SHAP Summary Plot
 ax1 = axes[0]
-ax1.set_facecolor('#1a1a2e')
+ax1.set_facecolor(VIZ_BG_PANEL)
 shap.summary_plot(
     shap_values,
     X_test,
-    feature_names=selected_features,
+    feature_names=SELECTED_FEATURES,
     plot_type='bar',
     show=False,
     plot_size=None
 )
 plt.sca(ax1)
-ax1.set_facecolor('#1a1a2e')
-ax1.tick_params(colors='white')
-ax1.set_xlabel('Mean |SHAP Value|', color='white')
+ax1.set_facecolor(VIZ_BG_PANEL)
+ax1.tick_params(colors=VIZ_TEXT)
+ax1.set_xlabel('Mean |SHAP Value|', color=VIZ_TEXT)
 ax1.set_title('Feature Importance (SHAP)\n'
               'Impact on Default Prediction',
-              color='white', fontsize=12,
+              color=VIZ_TEXT, fontsize=12,
               fontweight='bold')
 
 plt.tight_layout()
 plt.savefig('fig4_shap.png', dpi=150,
             bbox_inches='tight',
-            facecolor='#0f1117')
+            facecolor=VIZ_BG_DARK)
 plt.show()
 print("✅ SHAP chart saved!")
 
@@ -1335,7 +1218,7 @@ print("=" * 55)
 for name, app_data in applicants.items():
     result = score_applicant(
         app_data, lr_model, scaler,
-        selected_features, explainer)
+        SELECTED_FEATURES, explainer)
 
     print(f"\n{'─'*50}")
     print(f"APPLICANT: {name}")
@@ -1468,11 +1351,11 @@ print("=" * 55)
 explainer_cal = shap.LinearExplainer(
     lr_calibrated,
     X_train_cal,
-    feature_names=selected_features)
+    feature_names=SELECTED_FEATURES)
 
 for name, app_data in applicants.items():
     X_app    = pd.DataFrame([app_data],
-                             columns=selected_features)
+                             columns=SELECTED_FEATURES)
     X_scaled = scaler.transform(X_app)
     pd_prob  = lr_calibrated.predict_proba(X_scaled)[0,1]
     score    = probability_to_score(np.array([pd_prob]))[0]
@@ -1493,7 +1376,7 @@ for name, app_data in applicants.items():
     # SHAP
     shap_vals = explainer_cal.shap_values(X_scaled)[0]
     shap_df   = pd.DataFrame({
-        'Feature': selected_features,
+        'Feature': SELECTED_FEATURES,
         'SHAP':    shap_vals
     }).sort_values('SHAP', key=abs, ascending=False)
 
@@ -1517,7 +1400,7 @@ import pickle
 model_objects = {
     'model':      lr_calibrated,
     'scaler':     scaler,
-    'features':   selected_features,
+    'features':   SELECTED_FEATURES,
     'explainer':  explainer_cal
 }
 with open('pd_model.pkl', 'wb') as f:
@@ -1624,29 +1507,26 @@ print(band_final.to_string(index=False))
 
 # ── Final visualization ────────────────────────
 fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-fig.patch.set_facecolor('#0f1117')
+fig.patch.set_facecolor(VIZ_BG_DARK)
 
 # Plot 1: Score distribution
 ax1 = axes[0]
-ax1.set_facecolor('#1a1a2e')
+ax1.set_facecolor(VIZ_BG_PANEL)
 good_scores = credit_scores_final[y_test.values == 0]
 bad_scores  = credit_scores_final[y_test.values == 1]
 ax1.hist(good_scores, bins=40, alpha=0.7,
-         color='#22c55e', label='Good', density=True)
+         color=VIZ_COLOR_GOOD, label='Good', density=True)
 ax1.hist(bad_scores,  bins=40, alpha=0.7,
-         color='#ef4444', label='Default', density=True)
-ax1.set_title('Credit Score Distribution\nGood vs Default',
-              color='white', fontsize=11, fontweight='bold')
-ax1.set_xlabel('Credit Score', color='white')
-ax1.set_ylabel('Density', color='white')
-ax1.tick_params(colors='white')
-ax1.legend(facecolor='#1a1a2e', labelcolor='white')
-ax1.axvline(x=700, color='#f59e0b', linestyle='--',
+         color=VIZ_COLOR_BAD, label='Default', density=True)
+style_axis(ax1, title='Credit Score Distribution\nGood vs Default',
+           xlabel='Credit Score', ylabel='Density')
+ax1.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT)
+ax1.axvline(x=700, color=VIZ_COLOR_ACCENT, linestyle='--',
             linewidth=2, label='Approval threshold')
 
 # Plot 2: PD by score band
 ax2 = axes[1]
-ax2.set_facecolor('#1a1a2e')
+ax2.set_facecolor(VIZ_BG_PANEL)
 band_order = ['Poor (300-579)', 'Fair (580-669)',
               'Good (670-739)', 'Very Good (740-799)',
               'Exceptional (800-900)']
@@ -1654,55 +1534,53 @@ band_data  = score_df_final.groupby(
     'band', observed=True)['actual'].mean() * 100
 band_data  = band_data.reindex(
     [b for b in band_order if b in band_data.index])
-colors_band = ['#ef4444','#f59e0b',
-               '#22c55e','#16a34a','#15803d']
+colors_band = [VIZ_COLOR_BAD,VIZ_COLOR_ACCENT,
+               VIZ_COLOR_GOOD,VIZ_COLOR_GOOD,VIZ_COLOR_GOOD]
 bars = ax2.bar(range(len(band_data)),
                band_data.values,
                color=colors_band[:len(band_data)],
-               edgecolor='white', linewidth=0.5)
+               edgecolor=VIZ_TEXT, linewidth=0.5)
 ax2.set_title('Default Rate by Score Band',
-              color='white', fontsize=11, fontweight='bold')
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
 ax2.set_xticks(range(len(band_data)))
 ax2.set_xticklabels([b.split('(')[0].strip()
                      for b in band_data.index],
-                    rotation=30, color='white', fontsize=8)
-ax2.set_ylabel('Default Rate (%)', color='white')
-ax2.tick_params(colors='white')
+                    rotation=30, color=VIZ_TEXT, fontsize=8)
+ax2.set_ylabel('Default Rate (%)', color=VIZ_TEXT)
+ax2.tick_params(colors=VIZ_TEXT)
 for bar, val in zip(bars, band_data.values):
     ax2.text(bar.get_x() + bar.get_width()/2,
              bar.get_height() + 0.1,
              f'{val:.1f}%', ha='center',
-             color='white', fontsize=9)
+             color=VIZ_TEXT, fontsize=9)
 
 # Plot 3: Before vs After correction
 ax3 = axes[2]
-ax3.set_facecolor('#1a1a2e')
+ax3.set_facecolor(VIZ_BG_PANEL)
 ax3.hist(y_pred_proba,     bins=50, alpha=0.6,
-         color='#ef4444', label='Before correction',
+         color=VIZ_COLOR_BAD, label='Before correction',
          density=True)
 ax3.hist(y_pred_corrected, bins=50, alpha=0.6,
-         color='#22c55e', label='After correction',
+         color=VIZ_COLOR_GOOD, label='After correction',
          density=True)
-ax3.axvline(x=y_test.mean(), color='#f59e0b',
+ax3.axvline(x=y_test.mean(), color=VIZ_COLOR_ACCENT,
             linestyle='--', linewidth=2,
             label=f'True rate ({y_test.mean()*100:.1f}%)')
 ax3.set_title('PD Distribution\nBefore vs After Calibration',
-              color='white', fontsize=11, fontweight='bold')
-ax3.set_xlabel('Predicted Default Probability', color='white')
-ax3.set_ylabel('Density', color='white')
-ax3.tick_params(colors='white')
-ax3.legend(facecolor='#1a1a2e', labelcolor='white',
+              color=VIZ_TEXT, fontsize=11, fontweight='bold')
+ax3.set_xlabel('Predicted Default Probability', color=VIZ_TEXT)
+ax3.set_ylabel('Density', color=VIZ_TEXT)
+ax3.tick_params(colors=VIZ_TEXT)
+ax3.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT,
            fontsize=8)
 
 plt.suptitle('Credit Scorecard — Final Calibration Results',
-             color='white', fontsize=13,
+             color=VIZ_TEXT, fontsize=13,
              fontweight='bold')
 plt.tight_layout()
-plt.savefig('fig5_calibration.png', dpi=150,
-            bbox_inches='tight',
-            facecolor='#0f1117')
+save_figure(fig, FIG_CALIBRATION, close=False)
 plt.show()
-print("✅ Calibration chart saved!")
+logger.info(f'Calibration chart saved as {FIG_CALIBRATION}')
 
 # ── Score 3 applicants with corrected model ────
 print(f"\n{'='*55}")
@@ -1711,7 +1589,7 @@ print("=" * 55)
 
 for name, app_data in applicants.items():
     X_app    = pd.DataFrame([app_data],
-                             columns=selected_features)
+                             columns=SELECTED_FEATURES)
     X_scaled = scaler.transform(X_app)
 
     # Get raw probability from SMOTE model
@@ -1744,7 +1622,7 @@ for name, app_data in applicants.items():
     # SHAP from original model
     shap_vals = explainer.shap_values(X_scaled)[0]
     shap_df   = pd.DataFrame({
-        'Feature': selected_features,
+        'Feature': SELECTED_FEATURES,
         'SHAP':    shap_vals
     }).sort_values('SHAP', key=abs, ascending=False)
 
@@ -1768,13 +1646,13 @@ for name, app_data in applicants.items():
 model_final = {
     'model':          lr_model,
     'scaler':         scaler,
-    'features':       selected_features,
+    'features':       SELECTED_FEATURES,
     'explainer':      explainer,
     'prior_correct':  prior_correction,
     'real_prior':     float(y_test.mean()),
     'auc_roc':        float(auc_roc),
     'gini':           float(gini),
-    'ks':             float(ks_statistic)
+    'ks':             float(ks_stat)
 }
 
 with open('pd_model_final.pkl', 'wb') as f:
@@ -1785,7 +1663,7 @@ print(f"✅ FINAL MODEL SAVED — pd_model_final.pkl")
 print(f"{'='*55}")
 print(f"AUC-ROC:  {auc_roc:.4f}")
 print(f"Gini:     {gini:.4f}")
-print(f"KS Stat:  {ks_statistic:.4f}")
+print(f"KS Stat:  {ks_stat:.4f}")
 print(f"Avg PD after correction: "
       f"{y_pred_corrected.mean()*100:.2f}%")
 print(f"True default rate:       "
@@ -1942,56 +1820,56 @@ print(f"  ECL/EAD ratio:        "
 
 # ── STEP 6: VISUALIZE ECL ─────────────────────
 fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-fig.patch.set_facecolor('#0f1117')
+fig.patch.set_facecolor(VIZ_BG_DARK)
 
 # Plot 1: IFRS 9 Stage Distribution
 ax1 = axes[0, 0]
-ax1.set_facecolor('#1a1a2e')
+ax1.set_facecolor(VIZ_BG_PANEL)
 stage_counts = pd.Series(stages).value_counts()
-stage_colors = {'Stage 1': '#22c55e',
-                'Stage 2': '#f59e0b',
-                'Stage 3': '#ef4444'}
+stage_colors = {'Stage 1': VIZ_COLOR_GOOD,
+                'Stage 2': VIZ_COLOR_ACCENT,
+                'Stage 3': VIZ_COLOR_BAD}
 bars = ax1.bar(stage_counts.index,
                stage_counts.values,
                color=[stage_colors[s]
                       for s in stage_counts.index],
-               edgecolor='white', linewidth=0.5)
+               edgecolor=VIZ_TEXT, linewidth=0.5)
 ax1.set_title('IFRS 9 Stage Distribution',
-              color='white', fontsize=11,
+              color=VIZ_TEXT, fontsize=11,
               fontweight='bold')
-ax1.set_ylabel('Number of Loans', color='white')
-ax1.tick_params(colors='white')
+ax1.set_ylabel('Number of Loans', color=VIZ_TEXT)
+ax1.tick_params(colors=VIZ_TEXT)
 for bar, val in zip(bars, stage_counts.values):
     ax1.text(bar.get_x() + bar.get_width()/2,
              bar.get_height() + 50,
              f'{val:,}\n({val/len(stages)*100:.1f}%)',
-             ha='center', color='white', fontsize=9)
+             ha='center', color=VIZ_TEXT, fontsize=9)
 
 # Plot 2: ECL by Stage
 ax2 = axes[0, 1]
-ax2.set_facecolor('#1a1a2e')
+ax2.set_facecolor(VIZ_BG_PANEL)
 ecl_by_stage = ecl_df.groupby(
     'Stage')['ECL_Lifetime'].sum()
 bars2 = ax2.bar(ecl_by_stage.index,
                 ecl_by_stage.values / 1e6,
                 color=[stage_colors[s]
                        for s in ecl_by_stage.index],
-                edgecolor='white', linewidth=0.5)
+                edgecolor=VIZ_TEXT, linewidth=0.5)
 ax2.set_title('Total ECL by IFRS 9 Stage ($M)',
-              color='white', fontsize=11,
+              color=VIZ_TEXT, fontsize=11,
               fontweight='bold')
-ax2.set_ylabel('ECL ($ Millions)', color='white')
-ax2.tick_params(colors='white')
+ax2.set_ylabel('ECL ($ Millions)', color=VIZ_TEXT)
+ax2.tick_params(colors=VIZ_TEXT)
 for bar, val in zip(bars2, ecl_by_stage.values):
     ax2.text(bar.get_x() + bar.get_width()/2,
              bar.get_height() + 0.1,
              f'${val/1e6:.1f}M',
-             ha='center', color='white', fontsize=10,
+             ha='center', color=VIZ_TEXT, fontsize=10,
              fontweight='bold')
 
 # Plot 3: ECL by Loan Type
 ax3 = axes[0, 2]
-ax3.set_facecolor('#1a1a2e')
+ax3.set_facecolor(VIZ_BG_PANEL)
 ecl_loan = ecl_df.groupby(
     'Loan_Type')['ECL_Lifetime'].sum().sort_values(
     ascending=True)
@@ -2000,37 +1878,37 @@ colors_loan = plt.cm.RdYlGn(
 ax3.barh(range(len(ecl_loan)),
          ecl_loan.values / 1e6,
          color=colors_loan,
-         edgecolor='white', linewidth=0.5)
+         edgecolor=VIZ_TEXT, linewidth=0.5)
 ax3.set_yticks(range(len(ecl_loan)))
 ax3.set_yticklabels(ecl_loan.index,
-                    color='white', fontsize=9)
+                    color=VIZ_TEXT, fontsize=9)
 ax3.set_title('ECL by Loan Type ($M)',
-              color='white', fontsize=11,
+              color=VIZ_TEXT, fontsize=11,
               fontweight='bold')
-ax3.set_xlabel('ECL ($ Millions)', color='white')
-ax3.tick_params(colors='white')
+ax3.set_xlabel('ECL ($ Millions)', color=VIZ_TEXT)
+ax3.tick_params(colors=VIZ_TEXT)
 
 # Plot 4: ECL Distribution
 ax4 = axes[1, 0]
-ax4.set_facecolor('#1a1a2e')
+ax4.set_facecolor(VIZ_BG_PANEL)
 ax4.hist(ecl_values[ecl_values < 10000],
-         bins=50, color='#6366f1',
-         edgecolor='white', linewidth=0.3)
+         bins=50, color=VIZ_COLOR_NEUTRAL,
+         edgecolor=VIZ_TEXT, linewidth=0.3)
 ax4.set_title('ECL Distribution per Loan\n'
               '(12-Month ECL)',
-              color='white', fontsize=11,
+              color=VIZ_TEXT, fontsize=11,
               fontweight='bold')
-ax4.set_xlabel('ECL per Loan ($)', color='white')
-ax4.set_ylabel('Count', color='white')
-ax4.tick_params(colors='white')
-ax4.axvline(x=ecl_values.mean(), color='#f59e0b',
+ax4.set_xlabel('ECL per Loan ($)', color=VIZ_TEXT)
+ax4.set_ylabel('Count', color=VIZ_TEXT)
+ax4.tick_params(colors=VIZ_TEXT)
+ax4.axvline(x=ecl_values.mean(), color=VIZ_COLOR_ACCENT,
             linestyle='--', linewidth=2,
             label=f'Mean=${ecl_values.mean():,.0f}')
-ax4.legend(facecolor='#1a1a2e', labelcolor='white')
+ax4.legend(facecolor=VIZ_BG_PANEL, labelcolor=VIZ_TEXT)
 
 # Plot 5: Score vs ECL
 ax5 = axes[1, 1]
-ax5.set_facecolor('#1a1a2e')
+ax5.set_facecolor(VIZ_BG_PANEL)
 scatter = ax5.scatter(
     credit_scores_final,
     ecl_values,
@@ -2040,15 +1918,15 @@ plt.colorbar(scatter, ax=ax5,
              label='Default Probability')
 ax5.set_title('Credit Score vs ECL\n'
               'Color = Default Probability',
-              color='white', fontsize=11,
+              color=VIZ_TEXT, fontsize=11,
               fontweight='bold')
-ax5.set_xlabel('Credit Score', color='white')
-ax5.set_ylabel('ECL ($)', color='white')
-ax5.tick_params(colors='white')
+ax5.set_xlabel('Credit Score', color=VIZ_TEXT)
+ax5.set_ylabel('ECL ($)', color=VIZ_TEXT)
+ax5.tick_params(colors=VIZ_TEXT)
 
 # Plot 6: Portfolio Summary Card
 ax6 = axes[1, 2]
-ax6.set_facecolor('#1a1a2e')
+ax6.set_facecolor(VIZ_BG_PANEL)
 ax6.axis('off')
 
 summary_items = [
@@ -2066,34 +1944,32 @@ summary_items = [
 
 ax6.text(0.5, 0.97, '📊 PORTFOLIO SUMMARY',
          ha='center', va='top',
-         color='#f59e0b', fontsize=12,
+         color=VIZ_COLOR_ACCENT, fontsize=12,
          fontweight='bold',
          transform=ax6.transAxes)
 
 for i, (label, value) in enumerate(summary_items):
     y_pos = 0.87 - i * 0.087
     ax6.text(0.05, y_pos, f"• {label}:",
-             color='white', fontsize=9,
+             color=VIZ_TEXT, fontsize=9,
              transform=ax6.transAxes)
     ax6.text(0.72, y_pos, value,
-             color='#22c55e', fontsize=9,
+             color=VIZ_COLOR_GOOD, fontsize=9,
              fontweight='bold',
              transform=ax6.transAxes)
 
 plt.suptitle('IFRS 9 Expected Credit Loss (ECL) Report\n'
              'ECL = PD × LGD × EAD | '
              'Stage 1/2/3 Classification',
-             color='white', fontsize=13,
+             color=VIZ_TEXT, fontsize=13,
              fontweight='bold')
 
 plt.tight_layout()
-plt.savefig('fig6_ecl.png', dpi=150,
-            bbox_inches='tight',
-            facecolor='#0f1117')
+save_figure(fig, FIG_ECL, close=False)
 plt.show()
-print("✅ ECL report saved as fig6_ecl.png")
-print("\n🏆 COMPLETE IFRS 9 ECL FRAMEWORK DONE!")
-print("PD ✅ | LGD ✅ | EAD ✅ | ECL ✅ | Staging ✅")
+logger.info(f'ECL report saved as {FIG_ECL}')
+print('\n🏆 COMPLETE IFRS 9 ECL FRAMEWORK DONE!')
+print('PD ✅ | LGD ✅ | EAD ✅ | ECL ✅ | Staging ✅')
 
 
 # In[ ]:
@@ -2200,7 +2076,7 @@ metrics = [
      '>0.75 required',   '✅ PASS'),
     ('Gini Coefficient', f'{gini:.4f}',
      '>0.60 required',   '✅ PASS'),
-    ('KS Statistic',     f'{ks_statistic:.4f}',
+    ('KS Statistic',     f'{ks_stat:.4f}',
      '>0.30 required',   '✅ PASS'),
     ('Recall (Default)', f'{tp/(tp+fn)*100:.1f}%',
      '>60% target',      '✅ PASS'),
@@ -2267,14 +2143,16 @@ print(f"\n{'='*60}")
 print("11. TECHNOLOGY STACK")
 print(f"{'='*60}")
 tech = [
-    'Python 3.12',
+    'Python 3.11',
     'Pandas + NumPy (data processing)',
     'Scikit-learn (ML + preprocessing)',
     'Imbalanced-learn (SMOTE)',
     'SHAP (explainability)',
     'Matplotlib + Seaborn (visualization)',
-    'Pickle (model serialization)',
-    'Google Colab (development environment)',
+    'Plotly (interactive charts)',
+    'Streamlit (web application)',
+    'Pickle / Joblib (model serialization)',
+    'VS Code + Jupyter (development)',
 ]
 for t in tech:
     print(f"  ✅ {t}")
@@ -2314,160 +2192,13 @@ Ready for: Deloitte, KPMG, EY, PwC,
            Goldman Sachs, JP Morgan GCC
 """)
 
-
-# In[ ]:
-
-
-print(scaler.feature_names_in_)
-
-
-# In[ ]:
-
-
-import pickle
-
-# Save only model + scaler
-clean_model = {
-    "model": lr_model,
-    "scaler": scaler
-}
-
-with open("pd_model_final.pkl", "wb") as f:
-    pickle.dump(clean_model, f)
-
-print("New clean model saved successfully")
-
-
-# In[ ]:
-
-
-print(lr_model.coef_)
-
-
-# In[ ]:
-
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-from sklearn.metrics import (
-    roc_auc_score,
-    confusion_matrix,
-    classification_report,
-    roc_curve
-)
-
-from sklearn.calibration import calibration_curve
-from scipy.stats import ks_2samp
-
-
-# In[ ]:
-
-
-# predicted probabilities
-
-y_pred_prob = lr_model.predict_proba(X_test_scaled)[:,1]
-
-# predicted class
-
-y_pred = lr_model.predict(X_test_scaled)
-
-
-# In[ ]:
-
-
-auc = roc_auc_score(y_test, y_pred_prob)
-
-print("AUC Score:", auc)
-
-
-# In[ ]:
-
-
-cm = confusion_matrix(y_test, y_pred)
-
-print("Confusion Matrix:")
-print(cm)
-
-
-# In[ ]:
-
-
-print(classification_report(y_test, y_pred))
-
-
-# In[ ]:
-
-
-good = y_pred_prob[y_test == 0]
-bad = y_pred_prob[y_test == 1]
-
-ks_stat = ks_2samp(good, bad).statistic
-
-print("KS Statistic:", ks_stat)
-
-
-# In[ ]:
-
-
-fpr, tpr, thresholds = roc_curve(y_test, y_pred_prob)
-
-plt.figure(figsize=(6,6))
-
-plt.plot(fpr, tpr, label=f"AUC = {auc:.3f}")
-plt.plot([0,1],[0,1],'--')
-
-plt.xlabel("False Positive Rate")
-plt.ylabel("True Positive Rate")
-plt.title("ROC Curve")
-plt.legend()
-
-plt.show()
-
-
-# In[ ]:
-
-
-prob_true, prob_pred = calibration_curve(y_test, y_pred_prob, n_bins=10)
-
-plt.figure(figsize=(6,6))
-
-plt.plot(prob_pred, prob_true, marker='o')
-plt.plot([0,1],[0,1],'--')
-
-plt.xlabel("Predicted Probability")
-plt.ylabel("Actual Default Rate")
-plt.title("Calibration Curve")
-
-plt.show()
-
-
-# In[ ]:
-
-
-features = X.columns
-
-coefficients = lr_model.coef_[0]
-
-importance = pd.DataFrame({
-    "Feature": features,
-    "Coefficient": coefficients
-})
-
-importance = importance.sort_values(by="Coefficient", ascending=False)
-
-print(importance)
-
-
-# In[ ]:
-
-
-plt.hist(y_pred_prob, bins=50)
-
-plt.title("PD Distribution")
-plt.xlabel("Probability of Default")
-plt.ylabel("Count")
-
-plt.show()
+# ═══════════════════════════════════════════════════════════════
+# END OF PIPELINE
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    logger.info('Credit Risk Scorecard pipeline completed successfully')
+    logger.info(f'Model saved to: {MODEL_FINAL_PATH}')
+    logger.info(f'Figures saved:  fig1–fig6')
+    print('\n🏆 PIPELINE COMPLETE — ALL OUTPUTS GENERATED')
 

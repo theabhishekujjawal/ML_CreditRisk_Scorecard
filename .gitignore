@@ -1,43 +1,49 @@
-# Python
+# ==============================================================================
+# Credit Risk Scorecard — .gitignore
+# ==============================================================================
+
+# ── Python ────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
 *.egg-info/
-.installed.cfg
 *.egg
+dist/
+build/
+*.whl
 
-# Jupyter
-.ipynb_checkpoints
-
-# Environments
-.env
-.venv
-env/
+# ── Virtual environments ─────────────────────────────────────
+.venv/
 venv/
-ENV/
+env/
+.env
 
-# Data (Don't upload large datasets to GitHub)
-*.csv
-*.dat
-*.pkl
-*.h5
-*.parquet
-data/
-datasets/
+# ── IDE / Editor ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
 
-# OS
+# ── OS files ─────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Jupyter ──────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Model artefacts (optional — uncomment to track) ──────────
+# pd_model.pkl
+# pd_model_final.pkl
+
+# ── Data (large files — do not commit) ───────────────────────
+# cs-training.csv
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
+logs/
