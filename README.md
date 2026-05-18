@@ -373,7 +373,7 @@ app.py
 requirements.txt
 pd_model_final.pkl
 
-Credit_Risk_Scorecard_ParasJain.ipynb
+Credit_Risk_Scorecard.ipynb
 
 fig1_eda.png
 fig2_woe.png
@@ -392,7 +392,7 @@ README.md
 Clone the repository:
 
 
-git clone https://github.com/theabhishekujjawal/Credit-Risk-Scorecard.git
+git clone https://github.com/theabhishekujjawal/ML_CreditRisk_Scorecard.git
 
 
 Install dependencies:
@@ -446,7 +446,7 @@ Real bank models undergo additional **regulatory validation, stress testing, and
 
 **Abhishek Ujjawal**
 
-B.Tech CSE (AI)  
-UCD Michael Smurfit Graduate Business School  
+MSc Quantitative Finance — UCD Michael Smurfit Graduate Business School  
+B.Tech Electrical Engineering — Indian Institute of Technology (IIT) Patna  
 
-Email: theabhishekujjawal@gmail.com
+[LinkedIn](https://linkedin.com/in/theabhishekujjawal) · [GitHub](https://github.com/theabhishekujjawal) · [Portfolio](https://theabhishekujjawal.github.io/Bio)
