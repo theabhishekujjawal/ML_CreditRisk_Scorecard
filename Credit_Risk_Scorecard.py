@@ -1084,35 +1084,49 @@ print("✅ SHAP values calculated!")
 print(f"   Shape: {shap_values.shape}")
 
 # ── Visualize SHAP ─────────────────────────────
-fig, axes = plt.subplots(1, 2, figsize=(18, 8))
+fig, ax1 = plt.subplots(1, 1, figsize=(10, 8))
 fig.patch.set_facecolor(VIZ_BG_DARK)
+ax1.set_facecolor(VIZ_BG_PANEL)
 
-# SHAP Summary Plot
-ax1 = axes[0]
-ax1.set_facecolor(VIZ_BG_PANEL)
-shap.summary_plot(
-    shap_values,
-    X_test,
-    feature_names=SELECTED_FEATURES,
-    plot_type='bar',
-    show=False,
-    plot_size=None
+# Build SHAP importance manually (mean absolute SHAP per feature)
+mean_shap = np.abs(shap_values).mean(axis=0)
+shap_importance = pd.DataFrame({
+    'Feature': SELECTED_FEATURES,
+    'SHAP': mean_shap
+}).sort_values('SHAP', ascending=True)
+
+# Horizontal bar chart — full control over colours
+bars = ax1.barh(
+    range(len(shap_importance)),
+    shap_importance['SHAP'].values,
+    color=VIZ_COLOR_BAD,
+    edgecolor=VIZ_GRID,
+    linewidth=0.5,
+    height=0.7,
 )
-plt.sca(ax1)
-ax1.set_facecolor(VIZ_BG_PANEL)
-ax1.tick_params(colors=VIZ_TEXT)
-ax1.set_xlabel('Mean |SHAP Value|', color=VIZ_TEXT)
+ax1.set_yticks(range(len(shap_importance)))
+ax1.set_yticklabels(shap_importance['Feature'].values,
+                     fontsize=10, color=VIZ_TEXT)
+ax1.set_xlabel('Mean |SHAP Value|', fontsize=12, color=VIZ_TEXT)
 ax1.set_title('Feature Importance (SHAP)\n'
               'Impact on Default Prediction',
-              color=VIZ_TEXT, fontsize=12,
-              fontweight='bold')
+              color=VIZ_TEXT, fontsize=14, fontweight='bold')
+ax1.tick_params(colors=VIZ_TEXT)
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+ax1.spines['left'].set_color(VIZ_GRID)
+ax1.spines['bottom'].set_color(VIZ_GRID)
+
+# Annotate bars
+for bar in bars:
+    width = bar.get_width()
+    ax1.text(width + 0.002, bar.get_y() + bar.get_height() / 2,
+             f'{width:.3f}', va='center', fontsize=9, color=VIZ_TEXT)
 
 plt.tight_layout()
-plt.savefig('fig4_shap.png', dpi=150,
-            bbox_inches='tight',
-            facecolor=VIZ_BG_DARK)
+save_figure(fig, FIG_SHAP, close=False)
 plt.show()
-print("✅ SHAP chart saved!")
+logger.info(f'SHAP chart saved as {FIG_SHAP}')
 
 # ── PART C: INDIVIDUAL APPLICANT SCORING ───────
 print(f"\n{'='*55}")
